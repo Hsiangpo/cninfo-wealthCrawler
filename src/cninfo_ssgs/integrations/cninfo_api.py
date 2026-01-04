@@ -43,8 +43,12 @@ def _ms_to_date_str(ms: int | None) -> str:
     if not ms:
         return ""
     # cninfo 的 announcementTime 常见为“北京时间 00:00:00”的时间戳，
-    # 若直接按 UTC 取 date 可能偏差 1 天，因此按 Asia/Shanghai 取公告日期。
-    d = dt.datetime.fromtimestamp(ms / 1000, tz=ZoneInfo("Asia/Shanghai")).date()
+    # 若直接按 UTC 取 date 可能偏差 1 天，因此优先按 Asia/Shanghai。
+    try:
+        d = dt.datetime.fromtimestamp(ms / 1000, tz=ZoneInfo("Asia/Shanghai")).date()
+    except Exception:
+        # Windows 环境可能缺少 tzdata，降级为 UTC+8 固定时区，避免反复重试
+        d = dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone(dt.timedelta(hours=8))).date()
     return d.strftime("%Y-%m-%d")
 
 

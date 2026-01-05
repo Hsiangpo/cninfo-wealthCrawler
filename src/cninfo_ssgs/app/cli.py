@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("CNINFO_LLM_API_KEY 未设置，请通过环境变量提供（不要写入仓库）。")
         fixed_run_dir = Path(r"D:\Develop\Masterpiece\Spider\Website\cninfo_SSGS\output\20260103_full_8w")
         run_dir = fixed_run_dir
-        args.workers = 2
+        args.workers = 16
         args.llm_concurrency = 2
         args.llm = "always"
         args.llm_prefilter = True

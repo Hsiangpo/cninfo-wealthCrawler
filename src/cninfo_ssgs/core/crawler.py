@@ -534,112 +534,69 @@ def crawl_wealth_management(
                         purchase_amount=r.purchase_amount,
                         purchase_amount_yuan=r.purchase_amount_yuan,
                         purchase_date=r.purchase_date,
-                        extract_source=f"{r.extract_source}+llm",
+                        extract_source=r.extract_source,
                         snippet=r.snippet,
                     )
-                    seen.add((k, (new_name or "").strip(), (new_typ or "").strip()))
                 continue
 
             merged.append(lr)
             seen.add((k, name, typ))
-            if k:
-                idx_by_amount.setdefault(k, []).append(len(merged) - 1)
 
         return merged
 
-    def process_one(ann: Announcement, *, keyword: str, attempt: int = 0) -> tuple[str, list[PurchaseRecord], bool]:
-        clean_title = _clean_title(ann.title)
-        if log_announcements:
-            logger.info(
-                "开始处理公告 attempt=%s keyword=%s id=%s 公司=%s(%s) 日期=%s 标题=%s",
-                attempt,
-                keyword,
-                ann.announcement_id,
-                ann.sec_name,
-                ann.sec_code,
-                ann.announcement_date,
-                clean_title,
-            )
-            logger.info("公告链接 id=%s detail=%s pdf=%s", ann.announcement_id, ann.detail_url, ann.pdf_url)
+    def _handle_pdf_content(pdf_bytes: bytes, *, max_pages: int | None) -> tuple[str, str, list[list[list[str]]]]:
+        pdf_content = parse_pdf(pdf_bytes, max_pages=max_pages)
+        text = (pdf_content.text or "").strip()
+        tables = pdf_content.tables or []
+        return text, text[:1000], tables
 
+    def _load_pdf_bytes(client: HttpClient, ann: Announcement, *, force_download: bool) -> bytes:
+        pdf_name = f"{ann.announcement_id}.pdf"
+        pdf_path = pdf_dir / pdf_name
+        if pdf_path.exists() and not force_download:
+            return pdf_path.read_bytes()
+        pdf_bytes = download_pdf_bytes(client, ann.pdf_url)
+        pdf_path.write_bytes(pdf_bytes)
+        return pdf_bytes
+
+    def _prefilter_with_llm(ann: Announcement, pdf_bytes: bytes, *, pdf_text: str, tables: list[list[list[str]]]) -> bool:
+        if llm_extractor is None:
+            return True
+        if not prefilter_enabled:
+            return True
+        pdf_content = parse_pdf(pdf_bytes, max_pages=1)
+        return llm_extractor.prefilter(ann, pdf_content, pdf_bytes=pdf_bytes)
+
+    def process_one(ann: Announcement, *, keyword: str, attempt: int) -> tuple[str, list[PurchaseRecord], bool]:
         client = get_client()
-        pdf_path = pdf_dir / f"{ann.announcement_id}.pdf"
-
-        if pdf_path.exists() and not force:
-            pdf_bytes = pdf_path.read_bytes()
-        else:
-            pdf_bytes = download_pdf_bytes(client, ann.pdf_url)
-            pdf_path.write_bytes(pdf_bytes)
-
-        should_call_llm = llm_extractor is not None and llm_mode in {"always", "fallback"}
-        if prefilter_enabled and should_call_llm and llm_extractor is not None:
-            pre_pdf = parse_pdf(pdf_bytes, max_pages=1)
-            try:
-                logger.info(
-                    "LLM预筛开始 attempt=%s id=%s 公司=%s 日期=%s 标题=%s detail=%s",
-                    attempt,
-                    ann.announcement_id,
-                    ann.sec_name,
-                    ann.announcement_date,
-                    clean_title,
-                    ann.detail_url,
-                )
-                pre_relevant = llm_extractor.prefilter(
-                    ann,
-                    pre_pdf,
-                    pdf_bytes=pdf_bytes,
-                    attempt=attempt,
-                )
-                logger.info("LLM预筛完成 attempt=%s id=%s relevant=%s", attempt, ann.announcement_id, pre_relevant)
-            except Exception as exc:
-                with errors_path.open("a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "error": f"llm_prefilter_error: {str(exc)}",
-                                "attempt": attempt,
-                                "keyword": keyword,
-                                "announcement_id": ann.announcement_id,
-                                "sec_code": ann.sec_code,
-                                "company_name": ann.sec_name,
-                                "announcement_title": _clean_title(ann.title),
-                                "pdf_url": ann.pdf_url,
-                                "detail_url": ann.detail_url,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                stats["errors_written"] += 1
-                pre_relevant = True
-            if not pre_relevant:
-                logger.info("LLM预筛为非理财公告 id=%s", ann.announcement_id)
-                return ann.announcement_id, [], False
-
+        pdf_bytes = _load_pdf_bytes(client, ann, force_download=force)
         pdf_content = parse_pdf(pdf_bytes, max_pages=max_pdf_pages)
-        rule_recs: list[PurchaseRecord] = []
-        llm_relevant = True
-        if llm_mode == "off":
-            rule_recs = extract_records(ann, pdf_content)
-            if log_announcements:
-                logger.info("规则抽取完成 id=%s 记录数=%s", ann.announcement_id, len(rule_recs))
+
+        if prefilter_enabled and llm_extractor is not None:
+            try:
+                ok = llm_extractor.prefilter(ann, pdf_content, pdf_bytes=pdf_bytes, attempt=attempt)
+                logger.info("LLM预筛完成 attempt=%s id=%s relevant=%s", attempt, ann.announcement_id, ok)
+                if not ok:
+                    logger.info("LLM预筛为非理财公告 id=%s", ann.announcement_id)
+                    return ann.announcement_id, [], False
+            except Exception as exc:
+                logger.warning("LLM预筛失败 id=%s err=%s", ann.announcement_id, str(exc)[:200])
+
+        text = (pdf_content.text or "").strip()
+        tables = pdf_content.tables or []
+        rule_recs = extract_records(ann, text=text, tables=tables)
 
         llm_recs: list[PurchaseRecord] = []
-        if should_call_llm and llm_extractor is not None:
+        llm_relevant = True
+        if llm_mode != "off" and (llm_mode == "always" or not rule_recs):
+            if llm_extractor is None:
+                raise RuntimeError("LLM extractor is not initialized")
             try:
-                logger.info(
-                    "LLM分析开始 attempt=%s id=%s 公司=%s 日期=%s 标题=%s detail=%s",
-                    attempt,
-                    ann.announcement_id,
-                    ann.sec_name,
-                    ann.announcement_date,
-                    clean_title,
-                    ann.detail_url,
-                )
                 llm_result = llm_extractor.extract(
                     ann,
                     pdf_content,
                     pdf_bytes=pdf_bytes,
+                    rule_snippet=text[:2000],
                     attempt=attempt,
                 )
                 llm_relevant = bool(getattr(llm_result, "relevant", True))
@@ -920,6 +877,36 @@ def crawl_wealth_management(
     stats_unique_companies_seen: set[str] = set()
     stats_unique_companies_output: set[str] = set()
 
+    def _resolve_stock_progress_path(out_csv: Path) -> Path:
+        try:
+            parent = out_csv.parent
+            if parent.name == "data":
+                return parent.parent / "stock_progress.txt"
+            return parent / "stock_progress.txt"
+        except Exception:
+            return Path("stock_progress.txt")
+
+    stock_progress_path = _resolve_stock_progress_path(output_csv)
+
+    def _write_stock_progress(done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = (done / total) * 100
+        payload = (
+            f"companies_done={done}\n"
+            f"companies_total={total}\n"
+            f"progress_percent={pct:.2f}\n"
+            f"updated_at={dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        try:
+            stock_progress_path.parent.mkdir(parents=True, exist_ok=True)
+            stock_progress_path.write_text(payload, encoding="utf-8")
+        except Exception:
+            pass
+
+    companies_total = len(stock_list) if stock_source != "off" else 0
+    companies_done = 0
+
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
         pbar = tqdm(desc="processing", unit="ann")
 
@@ -974,6 +961,9 @@ def crawl_wealth_management(
 
                 if max_announcements is not None and total_submitted >= max_announcements:
                     break
+
+                companies_done += 1
+                _write_stock_progress(companies_done, companies_total)
         else:
             for keyword in keywords:
                 for chunk_start, chunk_end in _iter_date_chunks(start_date, end_date, date_chunk):
@@ -1065,6 +1055,9 @@ def crawl_wealth_management(
             flush_done(set(done))
 
         pbar.close()
+
+    if stock_source != "off":
+        _write_stock_progress(companies_done, companies_total)
 
     logger.info(
         "任务结束：新增processed=%s 总processed=%s rows=%s companies_seen=%s companies_output=%s errors=%s filtered_by_llm=%s retries_scheduled=%s",
